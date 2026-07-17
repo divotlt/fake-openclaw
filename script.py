@@ -14,12 +14,12 @@ from datetime import datetime, timezone
 from enum import Enum
 from html.parser import HTMLParser
 from typing import Any, Dict, List, Optional, Tuple
-from urllib.parse import urlparse, quote_plus
-from urllib.request import Request, urlopen
+from urllib.parse import quote_plus
 
 # Py-cord 2.8.0 Specific Imports
 import discord
 from discord.ext import tasks, commands
+import aiohttp
 
 # Configure high-quality system-wide logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
@@ -74,6 +74,9 @@ def extract_json_payload(text: str) -> dict:
 def initialize_local_profiles():
     """Verify presence of SOUL.md, IDENTITY.md, and MEMORY.md; auto-create templates if missing."""
     current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    if not current_dir or not os.path.exists(current_dir):
+        current_dir = os.getcwd()
+        
     templates = {
         "IDENTITY.md": (
             "# IDENTITY\n"
@@ -100,17 +103,19 @@ def initialize_local_profiles():
     }
     
     logger.info("--- Initializing & Verifying Persona Files ---")
+    logger.info(f"Targeting profile directory: {os.path.abspath(current_dir)}")
     for filename, content in templates.items():
         filepath = os.path.join(current_dir, filename)
+        os.makedirs(os.path.dirname(filepath), exist_ok=True)
         if not os.path.exists(filepath):
             try:
                 with open(filepath, "w", encoding="utf-8") as f:
                     f.write(content)
-                logger.info(f"Created template file: {filename} at {filepath}")
+                logger.info(f"Successfully generated template profile: {filepath}")
             except Exception as e:
-                logger.error(f"Failed to create template file {filename}: {e}")
+                logger.error(f"Failed to create template file {filename} at {filepath}: {e}")
         else:
-            logger.info(f"Verified existing file: {filename}")
+            logger.info(f"Verified profile exists: {filepath}")
     logger.info("----------------------------------------------")
 
 def load_local_profiles() -> Dict[str, str]:
@@ -119,6 +124,9 @@ def load_local_profiles() -> Dict[str, str]:
     profiles = {}
     filenames = ["SOUL.md", "IDENTITY.md", "MEMORY.md"]
     current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    if not current_dir or not os.path.exists(current_dir):
+        current_dir = os.getcwd()
+        
     for filename in filenames:
         filepath = os.path.join(current_dir, filename)
         try:
@@ -133,6 +141,9 @@ async def save_local_profile(filename: str, content: str, mode: str = "write"):
     if filename not in ["SOUL.md", "IDENTITY.md", "MEMORY.md"]:
         raise ValueError(f"Unauthorized persona file write target: {filename}")
     current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
+    if not current_dir or not os.path.exists(current_dir):
+        current_dir = os.getcwd()
+        
     filepath = os.path.join(current_dir, filename)
     try:
         write_mode = "a" if mode == "append" else "w"
@@ -148,7 +159,6 @@ async def save_local_profile(filename: str, content: str, mode: str = "write"):
 
 def compress_prompt(prompt: str, max_chars: int = 4000) -> str:
     """Compresses excess whitespace and dynamically truncates context to avoid GET URI maximum limits."""
-    # Normalize excessive spaces and vertical tabs to stay inside URI limit budgets
     prompt = re.sub(r'[ \t]+', ' ', prompt)
     prompt = re.sub(r'\n+', '\n', prompt)
     
@@ -167,44 +177,38 @@ def compress_prompt(prompt: str, max_chars: int = 4000) -> str:
             
     return prompt[:max_chars] + "\n...[Truncated]..."
 
-async def query_local_llm(text: str) -> str:
+async def query_local_llm(text: str, session: aiohttp.ClientSession) -> str:
     """Queries the MS Dev Tunnel LLM endpoint expecting structured nested JSON response."""
-    # Compress input prompt to safely fit inside GET HTTP request limits
     cleaned_text = compress_prompt(text)
     encoded_text = quote_plus(cleaned_text)
     
-    # Updated target endpoint to utilize MS Dev Tunnel text API with GET parameter
     url = f"https://d5bs5k1n-9401.usw3.devtunnels.ms/text?text={encoded_text}"
-    logger.info(f"Querying Dev Tunnel LLM: {url[:100]}... [Prompt Length: {len(cleaned_text)}]")
+    logger.info(f"Querying Dev Tunnel LLM: [Prompt Length: {len(cleaned_text)}]")
     
     try:
-        def request_worker():
-            req = Request(url, headers={"User-Agent": "ClawV12-Pycord/2.8.0"})
-            with urlopen(req, timeout=60) as resp:
-                return resp.read().decode("utf-8")
-        
-        raw_response = await asyncio.to_thread(request_worker)
-        data = json.loads(raw_response)
-        
-        # Extract and log internal LLM thinking/trace parameters if present
-        thinking = data.get("thinking")
-        if thinking:
-            logger.info(f"🧠 LLM Inner Thinking: {thinking}")
+        async with session.get(url, timeout=60) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"HTTP response error: {resp.status}")
+            raw_response = await resp.text()
+            data = json.loads(raw_response)
             
-        if "response" in data:
-            res_val = data["response"]
-            # The response field might contain a stringified nested JSON object
-            if isinstance(res_val, str):
-                try:
-                    inner_data = json.loads(res_val)
-                    if isinstance(inner_data, dict) and "output_response" in inner_data:
-                        return str(inner_data["output_response"])
-                except Exception:
-                    pass
-            elif isinstance(res_val, dict) and "output_response" in res_val:
-                return str(res_val["output_response"])
-            return str(res_val)
-        return str(data)
+            thinking = data.get("thinking")
+            if thinking:
+                logger.info(f"🧠 LLM Inner Thinking: {thinking}")
+                
+            if "response" in data:
+                res_val = data["response"]
+                if isinstance(res_val, str):
+                    try:
+                        inner_data = json.loads(res_val)
+                        if isinstance(inner_data, dict) and "output_response" in inner_data:
+                            return str(inner_data["output_response"])
+                    except Exception:
+                        pass
+                elif isinstance(res_val, dict) and "output_response" in res_val:
+                    return str(res_val["output_response"])
+                return str(res_val)
+            return str(data)
     except Exception as e:
         logger.error(f"Dev Tunnel LLM fetch failure: {e}")
         return f"Error connecting to Dev Tunnel LLM service: {e}"
@@ -224,7 +228,6 @@ def build_context_prompt(user_text: str, skills_list: List[Dict[str, Any]] = Non
     if skills_list:
         skills_formatted = []
         for s in skills_list:
-            # Format compactly (avoid full code blocks to respect safe GET URI lengths)
             skills_formatted.append(f"- Tool Name: {s['skill_name']} | Description: {s['description']}")
         skills_str = "\n".join(skills_formatted)
         system_ctx.append(f"### KNOWN DYNAMIC TOOLS:\nYou can invoke any of these tools using the EXECUTE_SKILL operation:\n{skills_str}")
@@ -516,15 +519,12 @@ class Executor:
             
         if op == "FETCH_WEB_CONTENT":
             url = str(step.get("args", {}).get("url", ""))
-            def fetch():
-                req = Request(url, headers={"User-Agent": "ClawV12/1.0"})
-                with urlopen(req, timeout=12) as r:
-                    html_bytes = r.read()
+            async with self.orchestrator.aiohttp_session.get(url, timeout=15) as resp:
+                html_bytes = await resp.read()
                 parser = _HTMLToText()
                 parser.feed(html_bytes.decode("utf-8", errors="ignore"))
-                return parser.text()[:5000]
-            text = await asyncio.wait_for(asyncio.to_thread(fetch), timeout=15)
-            return {"value": text, "text": text, "exit_code": 0}
+                text = parser.text()[:5000]
+                return {"value": text, "text": text, "exit_code": 0}
 
         if op == "PERFORM_HTTP_REQUEST":
             method = str(step.get("args", {}).get("method", "GET")).upper()
@@ -533,27 +533,19 @@ class Executor:
             headers = dict(step.get("args", {}).get("headers") or {})
             json_data = bool(step.get("args", {}).get("json_data", False))
             
-            def request():
-                body = None
-                req_headers = {"User-Agent": "ClawV12/1.0"}
-                req_headers.update(headers)
-                if data is not None:
-                    if json_data:
-                        body = json.dumps(data).encode("utf-8")
-                        req_headers["Content-Type"] = "application/json"
-                    elif isinstance(data, dict):
-                        from urllib.parse import urlencode
-                        body = urlencode(data).encode("utf-8")
-                        req_headers["Content-Type"] = "application/x-www-form-urlencoded"
-                    elif isinstance(data, str):
-                        body = data.encode("utf-8")
-                req = Request(url, data=body, headers=req_headers, method=method)
-                with urlopen(req, timeout=15) as resp:
-                    body_text = resp.read().decode("utf-8", errors="ignore")
-                    return {"status": getattr(resp, "status", 200), "text": body_text[:5000]}
-            res = await asyncio.wait_for(asyncio.to_thread(request), timeout=20)
-            res["exit_code"] = 0
-            return res
+            req_headers = {"User-Agent": "ClawV12/1.0"}
+            req_headers.update(headers)
+            
+            req_kwargs = {"headers": req_headers, "timeout": 20}
+            if data is not None:
+                if json_data:
+                    req_kwargs["json"] = data
+                else:
+                    req_kwargs["data"] = data
+                    
+            async with self.orchestrator.aiohttp_session.request(method, url, **req_kwargs) as resp:
+                body_text = await resp.text()
+                return {"status": resp.status, "text": body_text[:5000], "exit_code": 0}
 
         if op == "EXECUTE_PYTHON_CODE":
             code = str(step.get("args", {}).get("code", ""))
@@ -561,7 +553,7 @@ class Executor:
 
         if op == "EXECUTE_TERMINAL_COMMAND":
             command = str(step.get("args", {}).get("command", ""))
-            admin_user_id = 1041371551938908232 # Hardcoded supreme authorized administrator user ID
+            admin_user_id = 1041371551938908232
             
             channel = ctx.get("channel") if ctx else None
             if not channel:
@@ -735,7 +727,6 @@ class Executor:
             except Exception as exc:
                 logger.warning(f"Docker sandbox execution failed: {exc}. Trying direct host interpreter run...")
         
-        # Direct fallback execution on safe local scope
         local_globals = {"INPUTS": inputs, "RESULT": None, "json": json, "sys": sys, "os": os, "asyncio": asyncio}
         start = time.perf_counter()
         try:
@@ -785,14 +776,13 @@ class _HTMLToText(HTMLParser):
         return raw.strip()
 
 class Orchestrator:
-    def __init__(self, db_path='claw_v12_runtime.db', openai_client=None):
+    def __init__(self, db_path='claw_v12_runtime.db', aiohttp_session: aiohttp.ClientSession = None):
         self.db_path = db_path
         self.db = None
         self.db_lock = asyncio.Lock()
         self.executor = Executor(self)
-        self.openai_client = openai_client
+        self.aiohttp_session = aiohttp_session
         self._ready = asyncio.Event()
-        self.memory_embedding_model = os.getenv('OPENAI_EMBEDDING_MODEL', 'text-embedding-3-small')
         self.discord_client = None
         self.source_channel_id = None
 
@@ -896,8 +886,33 @@ class Orchestrator:
                     last_run TEXT,
                     created_at TEXT
                 );
+                CREATE TABLE IF NOT EXISTS ignored_entities (
+                    entity_id TEXT PRIMARY KEY,
+                    entity_type TEXT,
+                    reason TEXT,
+                    created_at TEXT
+                );
             ''')
             await self.db.commit()
+
+    async def ignore_entity(self, entity_id: str, entity_type: str, reason: str = ""):
+        async with self.db_lock:
+            await self.db.execute(
+                'INSERT OR REPLACE INTO ignored_entities VALUES (?, ?, ?, ?)',
+                (entity_id, entity_type, reason, iso_now())
+            )
+            await self.db.commit()
+
+    async def unignore_entity(self, entity_id: str):
+        async with self.db_lock:
+            await self.db.execute('DELETE FROM ignored_entities WHERE entity_id=?', (entity_id,))
+            await self.db.commit()
+
+    async def is_entity_ignored(self, entity_id: str) -> bool:
+        await self.initialize()
+        async with self.db.execute('SELECT 1 FROM ignored_entities WHERE entity_id=?', (entity_id,)) as cursor:
+            row = await cursor.fetchone()
+        return row is not None
 
     async def _emit_trace(self, event_type: str, step_id: Optional[str], message: str, data: dict = None):
         payload = {'message': message, 'data': data or {}}
@@ -1149,17 +1164,9 @@ class Orchestrator:
             return {"value": None, "text": f"{type(e).__name__}: {e}", "exit_code": 1}
 
     async def store_memory(self, content: str) -> dict:
-        embedding = None
-        if self.openai_client is not None:
-            try:
-                resp = await self.openai_client.embeddings.create(model=self.memory_embedding_model, input=content)
-                embedding = resp.data[0].embedding
-            except Exception as e:
-                logger.warning(f"Vector embedding generation failed: {e}")
-                
         rec = {
             "memory_id": str(uuid.uuid4()), "session_id": self.current_session_id,
-            "content": content, "embedding": embedding, "created_at": iso_now()
+            "content": content, "embedding": None, "created_at": iso_now()
         }
         async with self.db_lock:
             await self.db.execute(
@@ -1174,24 +1181,6 @@ class Orchestrator:
         async with self.db.execute('SELECT content, embedding FROM memories') as cursor:
             rows = await cursor.fetchall()
             
-        if self.openai_client is not None:
-            try:
-                q_resp = await self.openai_client.embeddings.create(model=self.memory_embedding_model, input=query)
-                q_vec = q_resp.data[0].embedding
-                scored = []
-                for (content, emb_json) in rows:
-                    vec = safe_json_loads(emb_json, None)
-                    if not vec:
-                        continue
-                    score = self._cosine_similarity(q_vec, vec)
-                    scored.append((score, content))
-                scored.sort(key=lambda x: x[0], reverse=True)
-                out = "\n\n".join(content for (score, content) in scored[:top_k]) if scored else "No memories found."
-                return {"value": out, "text": out, "exit_code": 0, "results": scored[:top_k]}
-            except Exception as e:
-                logger.warning(f"Query semantic search failed: {e}")
-                
-        # Simple word frequency overlap fallback (highly effective local fallback option)
         q_words = set(re.findall(r'\w+', query.lower()))
         scored_fallback = []
         for (content, _) in rows:
@@ -1203,16 +1192,6 @@ class Orchestrator:
         scored_fallback.sort(key=lambda x: x[0], reverse=True)
         out = "\n\n".join(content for (_, content) in scored_fallback[:top_k]) if scored_fallback else "No memories found."
         return {"value": out, "text": out, "exit_code": 0, "results": scored_fallback[:top_k]}
-
-    def _cosine_similarity(self, a, b) -> float:
-        if not a or not b or len(a) != len(b):
-            return 0.0
-        dot = sum(x*y for (x,y) in zip(a,b))
-        norm_a = sum(x*x for x in a) ** 0.5
-        norm_b = sum(y*y for y in b) ** 0.5
-        if norm_a == 0 or norm_b == 0:
-            return 0.0
-        return dot / (norm_a * norm_b)
 
     def verify_contract(self, result: dict, expected: dict) -> Tuple[bool, str]:
         target = result
@@ -1260,15 +1239,12 @@ class Orchestrator:
         """Autonomous reflection loop that executes post-session to write persistent feedback loops."""
         logger.info(f"Initiating autonomous continuous learning reflection for session: {session_id}")
         try:
-            # Query session data
             async with self.db.execute("SELECT plan_json, error FROM sessions WHERE session_id=?", (session_id,)) as cursor:
                 session_row = await cursor.fetchone()
             if not session_row:
                 return
             plan_json_str, sess_error = session_row
-            plan = safe_json_loads(plan_json_str, {})
             
-            # Extract step records for tracing errors
             async with self.db.execute("SELECT step_id, op, state, last_error FROM steps WHERE session_id=?", (session_id,)) as cursor:
                 step_rows = await cursor.fetchall()
             
@@ -1289,21 +1265,11 @@ class Orchestrator:
                 f"{{\n"
                 f"  \"lesson\": \"Paragraph outlining exactly what was learned and how to safely approach similar goals next time.\",\n"
                 f"  \"should_update_soul_directives\": false,\n"
-                f"  \"soul_patch_instruction\": \"Optional rule or caution statement to add to your SOUL.md system regulations (only provide if should_update_soul_directives is true)\"\n"
+                f"  \"soul_patch_instruction\": \"Optional rule or caution statement to add to your SOUL.md system regulations\"\n"
                 f"}}\n"
             )
             
-            raw_resp = ""
-            if self.openai_client is not None:
-                resp = await self.openai_client.chat.completions.create(
-                    model=os.getenv('CLAW_PLANNER_MODEL', 'gpt-4o-mini'),
-                    messages=[{"role": "user", "content": reflection_prompt}],
-                    response_format={'type': 'json_object'}
-                )
-                raw_resp = resp.choices[0].message.content
-            else:
-                raw_resp = await query_local_llm(reflection_prompt)
-                
+            raw_resp = await query_local_llm(reflection_prompt, self.aiohttp_session)
             analysis = extract_json_payload(raw_resp)
             if analysis and "lesson" in analysis:
                 lesson_text = f"- [Autonomous Run Lesson - {session_id} - {final_status.upper()}]: {analysis['lesson']}"
@@ -1313,7 +1279,7 @@ class Orchestrator:
                 if analysis.get("should_update_soul_directives") and analysis.get("soul_patch_instruction"):
                     soul_patch = f"- [Continuous Learning Correction]: {analysis['soul_patch_instruction']}"
                     await save_local_profile("SOUL.md", soul_patch, mode="append")
-                    logger.info(f"Self-evolution rules automatically appended to SOUL.md: {analysis['soul_patch_instruction']}")
+                    logger.info(f"Self-evolution rules automatically appended to SOUL.md")
         except Exception as e:
             logger.error(f"Post-execution continuous learning reflection phase failed: {e}")
 
@@ -1505,14 +1471,13 @@ class Orchestrator:
         await self._update_session(session_id, {"status": final_status, "steps_completed": succeeded, "steps_failed": failed})
         await self._emit_trace("SESSION_COMPLETED", None, 'Pipeline run completed', {"session_id": session_id, "succeeded": succeeded, "failed": failed, "skipped": skipped, "blocked": blocked})
         
-        # Trigger autonomous post-session continuous learning loops
         await self.reflect_and_learn(session_id, final_status)
         
         if dashboard_msg is not None:
             try:
                 final_embed = discord.Embed(
                     title=f"📋 Claw Automation Session Complete",
-                    description=f"Session status finished with: **{final_status.upper()}**\nID: `{session_id}`\nContinuous learning patches have been updated in MEMORY.md and SOUL.md.",
+                    description=f"Session status finished with: **{final_status.upper()}**\nID: `{session_id}`\nContinuous learning patches updated.",
                     color=discord.Color.green() if final_status == 'completed' else discord.Color.red()
                 )
                 final_embed.add_field(name="Succeeded Steps", value=str(succeeded), inline=True)
@@ -1525,8 +1490,7 @@ class Orchestrator:
         return {"session_id": session_id, "status": final_status}
 
 class ClawPlanner:
-    def __init__(self, client=None, orchestrator=None):
-        self.client = client
+    def __init__(self, orchestrator=None):
         self.orchestrator = orchestrator
 
     async def build_plan(self, goal: str) -> dict:
@@ -1538,13 +1502,13 @@ class ClawPlanner:
             "- FETCH_WEB_CONTENT (args: url)\n"
             "- PERFORM_HTTP_REQUEST (args: url, method, headers, data, json_data)\n"
             "- EXECUTE_PYTHON_CODE (args: code)\n"
-            "  * Note: When writing custom code inside EXECUTE_PYTHON_CODE, always store your output results to global variable `RESULT` or print them to stdout to be parsed successfully.\n"
+            "  * Note: Store output to global variable `RESULT` or print to stdout.\n"
             "- EXECUTE_TERMINAL_COMMAND (args: command)\n"
             "- STORE_MEMORY (args: content)\n"
             "- QUERY_MEMORY (args: query, top_k)\n"
             "- EDIT_PERSONA_FILE (args: filename, content, mode)\n"
             "  * Allowed filenames: 'SOUL.md', 'IDENTITY.md', 'MEMORY.md'\n"
-            "  * Modes: 'write' (overwrite) or 'append'\n"
+            "  * Modes: 'write' or 'append'\n"
             "- SEND_DIRECT_MESSAGE (args: user_id, content)\n"
             "- CREATE_DISCORD_CHANNEL (args: name)\n"
             "- DELETE_DISCORD_CHANNEL (args: none)\n"
@@ -1561,7 +1525,7 @@ class ClawPlanner:
             "- inputs: Dict of dynamic inputs linked to artifacts (e.g., {'text': '$step1'})\n"
             "- output_key: Unique artifact key (e.g., 'step2_out')\n"
             "- dependencies: List of output_key strings or step_ids this step depends on\n"
-            "- expected: Dict of validation checks (e.g., {'exit_code_zero': true})\n\n"
+            "- expected: Dict of validation checks\n\n"
             "Return ONLY a raw JSON object containing:\n"
             "{\n"
             "  \"plan_id\": \"uuid\",\n"
@@ -1569,7 +1533,6 @@ class ClawPlanner:
             "}\n"
         )
         
-        # Pull registered database skills to dynamic planner context
         skills_list = []
         if self.orchestrator:
             try:
@@ -1577,27 +1540,10 @@ class ClawPlanner:
             except Exception as e:
                 logger.error(f"Failed to fetch registered skills for planner context: {e}")
 
-        # Build injected context from template files and dynamic tool list
         full_prompt = build_context_prompt(f"{prompt}\n\n### Admin Goal:\n{goal}", skills_list=skills_list)
         
-        plan_raw = ""
-        if self.client is not None:
-            try:
-                resp = await self.client.chat.completions.create(
-                    model=os.getenv('CLAW_PLANNER_MODEL', 'gpt-4o-mini'),
-                    messages=[
-                        {"role": "system", "content": "You are a DAG compiler. Return only a strict JSON matching request schema."},
-                        {"role": "user", "content": full_prompt}
-                    ],
-                    response_format={'type': 'json_object'}
-                )
-                plan_raw = resp.choices[0].message.content
-            except Exception as e:
-                logger.error(f"OpenAI planning failed: {e}. Falling back to Local LLM...")
-                plan_raw = await query_local_llm(full_prompt)
-        else:
-            logger.info("Using Local MS Dev Tunnel LLM endpoint for planning compiler step...")
-            plan_raw = await query_local_llm(full_prompt)
+        logger.info("Using Local MS Dev Tunnel LLM endpoint for planning compiler step...")
+        plan_raw = await query_local_llm(full_prompt, self.orchestrator.aiohttp_session)
             
         plan = extract_json_payload(plan_raw)
         if not plan:
@@ -1625,10 +1571,39 @@ class ClawBot(discord.Bot):
         await self.orchestrator.initialize()
         self.orchestrator.discord_client = self
         
-        # Start Scheduler background loop
         if not self.task_scheduler.is_running():
             self.task_scheduler.start()
             logger.info("Background task scheduler active and listening.")
+
+    @discord.slash_command(name="ignore_user", description="Force the AI to ignore a specific user (Admin Only)")
+    async def ignore_user(self, ctx: discord.ApplicationContext, member: discord.Member, reason: str = ""):
+        if ctx.author.id != 1041371551938908232:
+            await ctx.respond("❌ **Unauthorized:** Only the supreme Administrator can command my attention boundaries.", ephemeral=True)
+            return
+        await self.orchestrator.ignore_entity(str(member.id), 'user', reason)
+        await ctx.respond(f"✅ Ignored user **{member.name}** (ID: `{member.id}`). I will no longer process their messages.", ephemeral=True)
+
+    @discord.slash_command(name="unignore_user", description="Allow the AI to interact with a specific user again (Admin Only)")
+    async def unignore_user(self, ctx: discord.ApplicationContext, member: discord.Member):
+        if ctx.author.id != 1041371551938908232:
+            await ctx.respond("❌ **Unauthorized:** Only the supreme Administrator can command my attention boundaries.", ephemeral=True)
+            return
+        await self.orchestrator.unignore_entity(str(member.id))
+        await ctx.respond(f"✅ Unignored user **{member.name}** (ID: `{member.id}`). I will process their messages if they benefit me.", ephemeral=True)
+
+    @discord.slash_command(name="list_ignored", description="Show all ignored entities (Admin Only)")
+    async def list_ignored(self, ctx: discord.ApplicationContext):
+        if ctx.author.id != 1041371551938908232:
+            await ctx.respond("❌ **Unauthorized:** Only the supreme Administrator can view my focus list.", ephemeral=True)
+            return
+        await self.orchestrator.initialize()
+        async with self.orchestrator.db.execute('SELECT entity_id, entity_type, reason, created_at FROM ignored_entities') as cursor:
+            rows = await cursor.fetchall()
+        if not rows:
+            await ctx.respond("ℹ️ No entities are currently ignored.", ephemeral=True)
+            return
+        lines = [f"- **{r[0]}** ({r[1]}) - Reason: *{r[2]}* (Since {r[3]})" for r in rows]
+        await ctx.respond("🚫 **Ignored Entities List:**\n" + "\n".join(lines), ephemeral=True)
 
     @tasks.loop(seconds=30.0)
     async def task_scheduler(self):
@@ -1638,7 +1613,6 @@ class ClawBot(discord.Bot):
                 return
                 
             now = utc_now()
-            # Query db for active pending schedules
             async with self.orchestrator.db.execute("SELECT task_id, task_description, schedule_time, plan_json, status, last_run FROM scheduled_tasks WHERE status = 'pending'") as cursor:
                 tasks_rows = await cursor.fetchall()
                 
@@ -1662,7 +1636,6 @@ class ClawBot(discord.Bot):
                         curr_hm = now.strftime("%H:%M")
                         today_date_str = now.strftime("%Y-%m-%d")
                         
-                        # Prevent multi-trigger within the scheduled minute
                         already_ran_today = False
                         if last_run:
                             try:
@@ -1705,23 +1678,61 @@ class ClawBot(discord.Bot):
         """Processes user input commands and kicks off automated execution DAG pipelines."""
         if message.author.bot:
             return
-            
-        content = message.content.strip()
-        if not content.startswith("!claw "):
+
+        # Check if user, channel, or server is ignored in SQLite database
+        if await self.orchestrator.is_entity_ignored(str(message.author.id)):
             return
-            
-        goal = content[len("!claw "):].strip()
-        if not goal:
+        if message.guild and await self.orchestrator.is_entity_ignored(str(message.guild.id)):
             return
+        if await self.orchestrator.is_entity_ignored(str(message.channel.id)):
+            return
+
+        # Attention selectivity logic: Query model to ask if answering benefits CLAW V12 Core
+        evaluation_prompt = (
+            f"### SYSTEM INTEGRITY & COGNITIVE GATE\n"
+            f"You are CLAW V12. To optimize resources, determine if responding to the message directly benefits you.\n\n"
+            f"### BENEFIT CRITERIA:\n"
+            f"1. You MUST respond (return should_respond: true) if the message:\n"
+            f"   - Commands you to execute scripts, write code, run terminal steps, update/edit files (SOUL, IDENTITY, MEMORY), or schedule tasks.\n"
+            f"   - Contains programming problems, server administration requests, or learning queries that enrich your dynamic tools repository.\n"
+            f"   - Mentions you with an actionable administrative opportunity.\n"
+            f"2. You MUST ignore (return should_respond: false) if the message is:\n"
+            f"   - Casual server noise, small talk, trolling, spam, or chat fluff with zero computational, organizational, or systemic reward.\n\n"
+            f"### CURRENT MESSAGE:\n"
+            f"Author: {message.author.name} (ID: {message.author.id})\n"
+            f"Channel: {message.channel.name if hasattr(message.channel, 'name') else 'DM'}\n"
+            f"Guild: {message.guild.name if message.guild else 'None'}\n"
+            f"Content:\n\"\"\"\n{message.content}\n\"\"\"\n\n"
+            f"Respond ONLY with a valid JSON block containing:\n"
+            f"{{\n"
+            f"  \"should_respond\": true,\n"
+            f"  \"reason\": \"Why this message benefits or does not benefit your cognitive system growth.\"\n"
+            f"}}\n"
+        )
+
+        try:
+            eval_raw = await query_local_llm(evaluation_prompt, self.orchestrator.aiohttp_session)
+            eval_data = extract_json_payload(eval_raw)
+            should_respond = bool(eval_data.get("should_respond", False))
             
-        # Inform user that plan generation has started
-        status_msg = await message.channel.send("🧠 **Claw Planner:** Analyzing request, loading soul templates, and compiling execution DAG blueprint...")
+            logger.info(f"Selectivity check for message from {message.author.name}: should_respond={should_respond} | Reason: {eval_data.get('reason')}")
+            
+            if not should_respond:
+                return
+        except Exception as e:
+            logger.error(f"Selectivity filter error: {e}. Defaulting to ignoring message to protect session queues.")
+            return
+
+        # Prepare execution goal
+        goal = message.content.strip()
+        if goal.startswith("!claw "):
+            goal = goal[len("!claw "):].strip()
+            
+        status_msg = await message.channel.send("🧠 **Claw Planner:** Goal accepted. Compiling optimized execution DAG...")
         
         try:
-            # Build DAG sequence
             plan = await self.planner.build_plan(goal)
             
-            # Form plan preview lines
             steps_desc = []
             for idx, s in enumerate(plan.get("steps", [])):
                 steps_desc.append(f"{idx+1}. **`{s.get('step_id')}`**: {s.get('op')} ➔ Output Key: `{s.get('output_key')}`")
@@ -1735,7 +1746,6 @@ class ClawBot(discord.Bot):
             plan_embed.set_footer(text="Initializing execution context pipeline...")
             await status_msg.edit(content=None, embed=plan_embed)
             
-            # Instantiate and trigger execution run
             session_id = await self.orchestrator.create_session(plan, source_user_id=str(message.author.id), source_channel_id=str(message.channel.id))
             
             execution_task = asyncio.create_task(
@@ -1757,22 +1767,32 @@ class ClawBot(discord.Bot):
             )
             await status_msg.edit(content=None, embed=error_embed)
 
-if __name__ == "__main__":
-    # Load required environment variables
-    token = os.getenv("DISCORD_BOT_TOKEN")
+async def main():
+    """Unified asynchronous entrypoint implementing high performance network clients."""
+    initialize_local_profiles()
     
+    token = os.getenv("DISCORD_BOT_TOKEN")
     if not token:
         logger.error("Missing critical configuration: DISCORD_BOT_TOKEN environmental variable is required.")
         sys.exit(1)
         
-    # Running strictly in local-first Dev Tunnel setup with no OpenAI requirement
-    logger.info("🟢 No OpenAI Key found or specified. Running strictly in Local-First MS Dev Tunnel Mode!")
-            
-    # Assemble orchestrator structure
-    runtime_orchestrator = Orchestrator(openai_client=None)
-    planner_compiler = ClawPlanner(client=None, orchestrator=runtime_orchestrator)
-    
-    # Fire up Py-Cord bot
-    logger.info("Starting Claw V12 Py-Cord client application...")
-    claw_bot = ClawBot(orchestrator=runtime_orchestrator, planner=planner_compiler)
-    claw_bot.run(token)
+    logger.info("Starting aiohttp client session loop...")
+    async with aiohttp.ClientSession() as session:
+        runtime_orchestrator = Orchestrator(aiohttp_session=session)
+        await runtime_orchestrator.initialize()
+        
+        planner_compiler = ClawPlanner(orchestrator=runtime_orchestrator)
+        claw_bot = ClawBot(orchestrator=runtime_orchestrator, planner=planner_compiler)
+        
+        logger.info("Starting Claw V12 Py-Cord client application...")
+        try:
+            await claw_bot.start(token)
+        except KeyboardInterrupt:
+            logger.info("Initiating elegant bot closure protocols...")
+            await claw_bot.close()
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot execution loop stopped cleanly.")
