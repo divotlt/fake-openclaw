@@ -21,11 +21,6 @@ from urllib.request import Request, urlopen
 import discord
 from discord.ext import tasks, commands
 
-try:
-    from openai import AsyncOpenAI
-except Exception:
-    AsyncOpenAI = None
-
 # Configure high-quality system-wide logging
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(name)s %(message)s')
 logger = logging.getLogger('ClawV12_Pycord')
@@ -124,22 +119,16 @@ def load_local_profiles() -> Dict[str, str]:
     profiles = {}
     filenames = ["SOUL.md", "IDENTITY.md", "MEMORY.md"]
     current_dir = os.path.dirname(os.path.abspath(__file__)) if "__file__" in globals() else os.getcwd()
-    
-    logger.info("--- Scanning for Persona Files ---")
     for filename in filenames:
         filepath = os.path.join(current_dir, filename)
-        if os.path.exists(filepath):
-            try:
-                with open(filepath, "r", encoding="utf-8") as f:
-                    content = f.read().strip()
-                    profiles[filename] = content
-                    logger.info(f"Loaded {filename} ({len(content)} bytes) from: {filepath}")
-            except Exception as e:
-                logger.error(f"Failed to read file {filename}: {e}")
-    logger.info("----------------------------------")
+        try:
+            with open(filepath, "r", encoding="utf-8") as f:
+                profiles[filename] = f.read()
+        except Exception as e:
+            logger.error(f"Failed to load persona file {filename}: {e}")
     return profiles
 
-def save_local_profile(filename: str, content: str, mode: str = "write"):
+async def save_local_profile(filename: str, content: str, mode: str = "write"):
     """Writes or appends content to local persona file (SOUL.md, IDENTITY.md, MEMORY.md) to facilitate learning."""
     if filename not in ["SOUL.md", "IDENTITY.md", "MEMORY.md"]:
         raise ValueError(f"Unauthorized persona file write target: {filename}")
@@ -157,11 +146,36 @@ def save_local_profile(filename: str, content: str, mode: str = "write"):
         logger.error(f"Failed to update persona file {filename}: {e}")
         raise e
 
+def compress_prompt(prompt: str, max_chars: int = 4000) -> str:
+    """Compresses excess whitespace and dynamically truncates context to avoid GET URI maximum limits."""
+    # Normalize excessive spaces and vertical tabs to stay inside URI limit budgets
+    prompt = re.sub(r'[ \t]+', ' ', prompt)
+    prompt = re.sub(r'\n+', '\n', prompt)
+    
+    if len(prompt) <= max_chars:
+        return prompt
+        
+    logger.warning(f"Compiled prompt size ({len(prompt)} chars) exceeds safe GET limit. Truncating context safely...")
+    if "### USER TASK/GOAL:" in prompt:
+        parts = prompt.split("### USER TASK/GOAL:")
+        system_part = parts[0]
+        task_part = "### USER TASK/GOAL:" + parts[1]
+        
+        allowed_system_len = max_chars - len(task_part) - 100
+        if allowed_system_len > 300:
+            return system_part[:allowed_system_len] + "\n...[Context Snipped for GET Safety]...\n" + task_part
+            
+    return prompt[:max_chars] + "\n...[Truncated]..."
+
 async def query_local_llm(text: str) -> str:
-    """Queries localhost:9401?text={text} expecting a JSON response incased with {'response': '...'}"""
-    encoded_text = quote_plus(text)
-    url = f"http://localhost:9401/?text={encoded_text}"
-    logger.info(f"Querying Local LLM: {url[:120]}...")
+    """Queries the MS Dev Tunnel LLM endpoint expecting structured nested JSON response."""
+    # Compress input prompt to safely fit inside GET HTTP request limits
+    cleaned_text = compress_prompt(text)
+    encoded_text = quote_plus(cleaned_text)
+    
+    # Updated target endpoint to utilize MS Dev Tunnel text API with GET parameter
+    url = f"https://d5bs5k1n-9401.usw3.devtunnels.ms/text?text={encoded_text}"
+    logger.info(f"Querying Dev Tunnel LLM: {url[:100]}... [Prompt Length: {len(cleaned_text)}]")
     
     try:
         def request_worker():
@@ -171,12 +185,29 @@ async def query_local_llm(text: str) -> str:
         
         raw_response = await asyncio.to_thread(request_worker)
         data = json.loads(raw_response)
+        
+        # Extract and log internal LLM thinking/trace parameters if present
+        thinking = data.get("thinking")
+        if thinking:
+            logger.info(f"🧠 LLM Inner Thinking: {thinking}")
+            
         if "response" in data:
-            return data["response"]
+            res_val = data["response"]
+            # The response field might contain a stringified nested JSON object
+            if isinstance(res_val, str):
+                try:
+                    inner_data = json.loads(res_val)
+                    if isinstance(inner_data, dict) and "output_response" in inner_data:
+                        return str(inner_data["output_response"])
+                except Exception:
+                    pass
+            elif isinstance(res_val, dict) and "output_response" in res_val:
+                return str(res_val["output_response"])
+            return str(res_val)
         return str(data)
     except Exception as e:
-        logger.error(f"Local LLM fetch failure: {e}")
-        return f"Error connecting to local LLM service: {e}"
+        logger.error(f"Dev Tunnel LLM fetch failure: {e}")
+        return f"Error connecting to Dev Tunnel LLM service: {e}"
 
 def build_context_prompt(user_text: str, skills_list: List[Dict[str, Any]] = None) -> str:
     """Combines Identity, Soul, Memory logs, and dynamic toolkits to inject into prompts."""
@@ -193,11 +224,12 @@ def build_context_prompt(user_text: str, skills_list: List[Dict[str, Any]] = Non
     if skills_list:
         skills_formatted = []
         for s in skills_list:
-            skills_formatted.append(f"- Name: {s['skill_name']}\n  Description: {s['description']}\n  Code:\n```python\n{s['code']}\n```")
+            # Format compactly (avoid full code blocks to respect safe GET URI lengths)
+            skills_formatted.append(f"- Tool Name: {s['skill_name']} | Description: {s['description']}")
         skills_str = "\n".join(skills_formatted)
-        system_ctx.append(f"### KNOWN DYNAMIC SKILLS/TOOLS:\nThese tools are already registered in the system database and can be invoked using the EXECUTE_SKILL operation:\n{skills_str}")
+        system_ctx.append(f"### KNOWN DYNAMIC TOOLS:\nYou can invoke any of these tools using the EXECUTE_SKILL operation:\n{skills_str}")
     else:
-        system_ctx.append("### KNOWN DYNAMIC SKILLS/TOOLS:\nNo custom skills/tools are currently registered. You can create them dynamically using `CREATE_SKILL`.")
+        system_ctx.append("### KNOWN DYNAMIC TOOLS:\nNo custom skills are currently registered. You can build tools on demand using `CREATE_SKILL`.")
         
     if system_ctx:
         system_prompt = "\n\n".join(system_ctx)
@@ -596,7 +628,7 @@ class Executor:
             filename = str(step.get("args", {}).get("filename", ""))
             content = str(step.get("args", {}).get("content", resolved_inputs.get("content", "")))
             mode = str(step.get("args", {}).get("mode", "write"))
-            save_local_profile(filename, content, mode)
+            await save_local_profile(filename, content, mode)
             return {"value": f"Persona file '{filename}' successfully updated.", "text": f"Updated profile {filename}", "exit_code": 0}
 
         if op == "STORE_MEMORY":
@@ -1159,7 +1191,7 @@ class Orchestrator:
             except Exception as e:
                 logger.warning(f"Query semantic search failed: {e}")
                 
-        # Simple word frequency overlap fallback
+        # Simple word frequency overlap fallback (highly effective local fallback option)
         q_words = set(re.findall(r'\w+', query.lower()))
         scored_fallback = []
         for (content, _) in rows:
@@ -1275,12 +1307,12 @@ class Orchestrator:
             analysis = extract_json_payload(raw_resp)
             if analysis and "lesson" in analysis:
                 lesson_text = f"- [Autonomous Run Lesson - {session_id} - {final_status.upper()}]: {analysis['lesson']}"
-                save_local_profile("MEMORY.md", lesson_text, mode="append")
+                await save_local_profile("MEMORY.md", lesson_text, mode="append")
                 logger.info(f"Self-reflection successfully preserved in MEMORY.md: {analysis['lesson']}")
                 
                 if analysis.get("should_update_soul_directives") and analysis.get("soul_patch_instruction"):
                     soul_patch = f"- [Continuous Learning Correction]: {analysis['soul_patch_instruction']}"
-                    save_local_profile("SOUL.md", soul_patch, mode="append")
+                    await save_local_profile("SOUL.md", soul_patch, mode="append")
                     logger.info(f"Self-evolution rules automatically appended to SOUL.md: {analysis['soul_patch_instruction']}")
         except Exception as e:
             logger.error(f"Post-execution continuous learning reflection phase failed: {e}")
@@ -1564,7 +1596,7 @@ class ClawPlanner:
                 logger.error(f"OpenAI planning failed: {e}. Falling back to Local LLM...")
                 plan_raw = await query_local_llm(full_prompt)
         else:
-            logger.info("Using local LLM at localhost:9401 for planner compile step...")
+            logger.info("Using Local MS Dev Tunnel LLM endpoint for planning compiler step...")
             plan_raw = await query_local_llm(full_prompt)
             
         plan = extract_json_payload(plan_raw)
@@ -1682,11 +1714,11 @@ class ClawBot(discord.Bot):
         if not goal:
             return
             
-        # 1. Inform user that plan generation has started
+        # Inform user that plan generation has started
         status_msg = await message.channel.send("🧠 **Claw Planner:** Analyzing request, loading soul templates, and compiling execution DAG blueprint...")
         
         try:
-            # 2. Build DAG sequence
+            # Build DAG sequence
             plan = await self.planner.build_plan(goal)
             
             # Form plan preview lines
@@ -1703,7 +1735,7 @@ class ClawBot(discord.Bot):
             plan_embed.set_footer(text="Initializing execution context pipeline...")
             await status_msg.edit(content=None, embed=plan_embed)
             
-            # 3. Instantiate and trigger execution run
+            # Instantiate and trigger execution run
             session_id = await self.orchestrator.create_session(plan, source_user_id=str(message.author.id), source_channel_id=str(message.channel.id))
             
             execution_task = asyncio.create_task(
@@ -1728,25 +1760,17 @@ class ClawBot(discord.Bot):
 if __name__ == "__main__":
     # Load required environment variables
     token = os.getenv("DISCORD_BOT_TOKEN")
-    openai_key = os.getenv("OPENAI_API_KEY")
     
     if not token:
         logger.error("Missing critical configuration: DISCORD_BOT_TOKEN environmental variable is required.")
         sys.exit(1)
         
-    # Configure OpenAI Client if present
-    o_client = None
-    if openai_key:
-        try:
-            from openai import AsyncOpenAI
-            o_client = AsyncOpenAI(api_key=openai_key)
-            logger.info("OpenAI client initialized for high-performance planning and semantic embeddings.")
-        except Exception as e:
-            logger.warning(f"Failed to import AsyncOpenAI or connect client: {e}. Falling back to default Local LLM mode.")
+    # Running strictly in local-first Dev Tunnel setup with no OpenAI requirement
+    logger.info("🟢 No OpenAI Key found or specified. Running strictly in Local-First MS Dev Tunnel Mode!")
             
     # Assemble orchestrator structure
-    runtime_orchestrator = Orchestrator(openai_client=o_client)
-    planner_compiler = ClawPlanner(client=o_client, orchestrator=runtime_orchestrator)
+    runtime_orchestrator = Orchestrator(openai_client=None)
+    planner_compiler = ClawPlanner(client=None, orchestrator=runtime_orchestrator)
     
     # Fire up Py-Cord bot
     logger.info("Starting Claw V12 Py-Cord client application...")
