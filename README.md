@@ -1,6 +1,5 @@
 This README.md was made by Grok.
 
-https://raw.githubusercontent.com/divotlt/cue/refs/heads/main/readme.md?token=GHSAT0AAAAAAECZ4M62DONH5DMUENIFQC7M2S2Q2CQ
 # Claw V8 Autonomic Administrator
 
 **An advanced autonomous AI agent for Discord**, powered by OpenAI's GPT-4o, equipped with dynamic concurrency control, background task orchestration, vector-based long-term memory, sandboxed code execution, web content retrieval, and full administrative capabilities over Discord servers.
